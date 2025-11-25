@@ -27,15 +27,15 @@ try {
   
   if (app) {
     try {
-      // ATIVAÇÃO DO CACHE PERSISTENTE
-      // Isso permite que o app funcione offline e sincronize em background,
-      // eliminando a sensação de lentidão em redes instáveis.
+      // ATIVAÇÃO DO CACHE PERSISTENTE & LONG POLLING
+      // experimentalForceLongPolling: Essencial para redes escolares/corporativas que bloqueiam WebSockets.
       db = initializeFirestore(app, {
         localCache: persistentLocalCache({
           tabManager: persistentMultipleTabManager()
-        })
+        }),
+        experimentalForceLongPolling: true 
       }); 
-      console.log("Firestore initialized successfully with Persistence enabled (Project ID:", firebaseConfig.projectId + ")");
+      console.log("Firestore initialized successfully (Persistence + Long Polling enabled)");
     } catch (fsError: any) {
       // Se falhar porque já foi inicializado (failed-precondition), tentamos pegar a instância existente
       if (fsError.code === 'failed-precondition') {

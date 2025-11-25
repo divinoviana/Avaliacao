@@ -1,3 +1,4 @@
+
 import React, { useState, useEffect, useRef } from 'react';
 import { authenticateUser, saveTeacherConfig, getStudentResults, getTeacherConfigs, getUsers, saveUser, deleteUser, updateUserPassword, exportDatabase, importDatabase, isSystemOffline, retryCloudConnection } from '../services/storageService';
 import { Subject, Bimester, StudentResult, User, UserRole } from '../types';
@@ -54,24 +55,28 @@ export const TeacherDashboard: React.FC<Props> = ({ onBack }) => {
 
         const fetchData = async () => {
             try {
-                // Load existing config
-                const configs = await getTeacherConfigs();
+                // Parallel Data Fetching for Performance
+                const configsPromise = getTeacherConfigs();
+                const resultsPromise = getStudentResults();
+                const usersPromise = currentUser.role === 'DIRECTOR' ? getUsers() : Promise.resolve([]);
+
+                const [configs, allResults, u] = await Promise.all([configsPromise, resultsPromise, usersPromise]);
+
+                // Update Config State
                 const current = configs.find(c => c.subject === subject && c.bimester === bimester);
                 if (current) setTopics(current.topics);
                 else setTopics('');
 
-                // Load results
-                const allResults = await getStudentResults();
+                // Update Results State
                 setResults(allResults);
 
-                // Extract unique classes for filter
+                // Update Filters
                 const classes = Array.from(new Set(allResults.map(r => r.studentClass || 'N/A').filter(c => c !== 'N/A'))).sort();
                 setUniqueClasses(classes);
 
-                // Load users if Director
+                // Update Users State
                 if (currentUser.role === 'DIRECTOR') {
-                    const u = await getUsers();
-                    setUsersList(u);
+                    setUsersList(u as User[]);
                 }
             } catch (err) {
                 console.error("Failed to load dashboard data", err);
