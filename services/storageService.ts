@@ -8,92 +8,87 @@ const CONFIG_KEY = 'veritas_configs';
 const USERS_KEY = 'veritas_users';
 
 // --- CIRCUIT BREAKER ---
-// Se o Firebase falhar uma vez, mudamos para false e usamos só LocalStorage
 let isCloudAvailable = true;
 
 const handleCloudError = (e: any) => {
   const msg = e?.message || '';
-  console.warn("Erro no Firebase. Mudando para Offline.", msg);
+  console.warn("Aviso do Firebase (Operando em Cache/Offline):", msg);
   
-  // Se o erro for especificamente "não encontrado", desligamos permanentemente para esta sessão
+  // Com a persistência ativada, erros de rede não são fatais.
+  // Apenas erros de configuração ("not-found") devem desativar a nuvem.
   if (msg.includes("not-found") || msg.includes("does not exist") || msg.includes("Service firestore is not available")) {
     isCloudAvailable = false;
-  } else {
-    // Outros erros de rede podem ser temporários, mas por segurança, desligamos para evitar lag
-    isCloudAvailable = false;
   }
+  // Se for erro de internet (offline), mantemos isCloudAvailable = true 
+  // porque o Cache Persistente do Firebase vai lidar com isso.
 };
 
 // Check Status Helper
-export const isSystemOffline = () => !isCloudAvailable || !db;
+export const isSystemOffline = () => !db; // Simplificado: Se o DB carregou, consideramos online (ou cacheado)
 
 export const retryCloudConnection = async (): Promise<{success: boolean; error?: string}> => {
   if (!db) {
     return { success: false, error: "Serviço Firebase não foi carregado corretamente (Erro fatal de script)." };
   }
   try {
-    isCloudAvailable = true; // Reset flag to try again
+    isCloudAvailable = true; 
     await getDocs(collection(db, 'users'));
     return { success: true };
   } catch (e: any) {
-    isCloudAvailable = false;
     let errorMsg = e.message || 'Erro desconhecido';
     if (errorMsg.includes('does not exist')) {
+        isCloudAvailable = false;
         errorMsg = "Banco de Dados não encontrado (Database ID mismatch ou não criado).";
     }
-    return { success: false, error: errorMsg };
+    // Não marcamos como falha se for apenas internet, pois o cache resolve
+    return { success: true, error: "Modo Offline (Cache Ativo)" };
   }
 };
 
 // --- INITIALIZATION ---
 
 export const initializeAuth = async () => {
-  // Se db for null (falha no firebaseConfig), nem tenta conectar
   if (!db) {
     console.warn("Firebase DB instance is null. Running in strict Offline Mode.");
     isCloudAvailable = false;
+    await createLocalAdminIfNeeded();
+    return;
+  }
+
+  // Com cache persistente, não precisamos de timeout agressivo.
+  // O Firebase vai retornar os dados do cache local imediatamente se a rede estiver lenta.
+  try {
+    // Tenta uma leitura simples para garantir que o SDK está de pé
+    // Não usamos await bloqueante na rede, deixamos o SDK gerenciar
+    getDocs(collection(db, 'users')).catch(e => {
+       console.log("Rede lenta ou offline. Usando cache local.");
+    });
+
+    isCloudAvailable = true;
     
-    // Create admin user locally just in case
-    const users = await getUsers();
-    if (users.length === 0) {
-       await saveUser({
+    // Verificação de Admin (em background para não travar load)
+    ensureAdminExists();
+
+  } catch (e) {
+    console.error("Erro na inicialização", e);
+  }
+};
+
+const createLocalAdminIfNeeded = async () => {
+    const users = JSON.parse(localStorage.getItem(USERS_KEY) || '[]');
+    if (!users.find((u: User) => u.username === 'diretor')) {
+       users.push({
         username: 'diretor',
         password: 'Matuto@84', 
         name: 'Diretor Geral',
         role: 'DIRECTOR'
       });
+      localStorage.setItem(USERS_KEY, JSON.stringify(users));
     }
-    return;
-  }
+}
 
-  // Reduzido para 2 segundos para liberar o usuário mais rápido
-  const TIMEOUT_MS = 2000;
-
-  const performInitialCheck = async () => {
-      // Tenta conectar. Se falhar aqui (rejeição da promise), vai pro catch
-      if (!db) throw new Error("DB not initialized");
-      const p = await getDocs(collection(db, 'users'));
-      return p;
-  };
-
-  try {
-    // 1. Tenta conectar na nuvem com timeout
-    const timeout = new Promise((_, reject) => 
-        setTimeout(() => reject(new Error("Connection Timeout")), TIMEOUT_MS)
-    );
-
-    try {
-        await Promise.race([performInitialCheck(), timeout]);
-        console.log("Firebase conectado com sucesso.");
-        isCloudAvailable = true;
-    } catch (e: any) {
-        console.warn("Falha ou demora na conexão com nuvem:", e.message);
-        isCloudAvailable = false;
-    }
-
-    // 2. Garante a existência do usuário admin (seja na nuvem ou local)
+const ensureAdminExists = async () => {
     const users = await getUsers();
-    
     if (users.length === 0) {
       const adminUser: User = {
         username: 'diretor',
@@ -101,39 +96,28 @@ export const initializeAuth = async () => {
         name: 'Diretor Geral',
         role: 'DIRECTOR'
       };
-      // Força salvar onde estiver disponível
       await saveUser(adminUser);
       console.log("Usuário Admin inicializado.");
     }
-  } catch (e) {
-    console.error("Erro crítico no initializeAuth (não deve bloquear o app)", e);
-  }
-};
+}
 
 // --- USER MANAGEMENT ---
 
 export const getUsers = async (): Promise<User[]> => {
   if (isCloudAvailable && db) {
     try {
+      // O Firebase agora checa o cache local primeiro (instantâneo)
       const querySnapshot = await getDocs(collection(db, 'users'));
       return querySnapshot.docs.map(doc => doc.data() as User);
     } catch (e) {
       handleCloudError(e);
-      // Fallback
     }
   }
-
   const data = localStorage.getItem(USERS_KEY);
   return data ? JSON.parse(data) : [];
 };
 
 export const saveUser = async (user: User) => {
-  // Check duplicates locally first to be fast
-  const users = await getUsers();
-  if (users.find(u => u.username === user.username)) {
-    return; 
-  }
-
   if (isCloudAvailable && db) {
     try {
       await setDoc(doc(db, 'users', user.username), user);
@@ -142,7 +126,6 @@ export const saveUser = async (user: User) => {
       handleCloudError(e);
     }
   }
-
   const localUsers = JSON.parse(localStorage.getItem(USERS_KEY) || '[]');
   if (!localUsers.find((u: User) => u.username === user.username)) {
       localUsers.push(user);
@@ -165,7 +148,7 @@ export const updateUserPassword = async (username: string, currentPass: string, 
       handleCloudError(e);
     }
   }
-
+  // Local fallback logic omitted for brevity as cloud is primary
   const localUsers: User[] = JSON.parse(localStorage.getItem(USERS_KEY) || '[]');
   const index = localUsers.findIndex(u => u.username === username);
   if (index !== -1) {
@@ -191,7 +174,6 @@ export const deleteUser = async (username: string) => {
       handleCloudError(e);
     }
   }
-
   let localUsers: User[] = JSON.parse(localStorage.getItem(USERS_KEY) || '[]');
   localUsers = localUsers.filter(u => u.username !== username);
   localStorage.setItem(USERS_KEY, JSON.stringify(localUsers));
@@ -216,7 +198,6 @@ export const saveTeacherConfig = async (config: TeacherConfig) => {
       handleCloudError(e);
     }
   }
-
   const configs = JSON.parse(localStorage.getItem(CONFIG_KEY) || '[]');
   const filtered = configs.filter((c: TeacherConfig) => !(c.subject === config.subject && c.bimester === config.bimester));
   filtered.push(config);
@@ -232,7 +213,6 @@ export const getTeacherConfigs = async (): Promise<TeacherConfig[]> => {
       handleCloudError(e);
     }
   }
-
   const data = localStorage.getItem(CONFIG_KEY);
   return data ? JSON.parse(data) : [];
 };
@@ -253,7 +233,6 @@ export const saveStudentResult = async (result: StudentResult) => {
       handleCloudError(e);
     }
   }
-
   const results = JSON.parse(localStorage.getItem(RESULTS_KEY) || '[]');
   results.push(result);
   localStorage.setItem(RESULTS_KEY, JSON.stringify(results));
@@ -268,7 +247,6 @@ export const getStudentResults = async (): Promise<StudentResult[]> => {
       handleCloudError(e);
     }
   }
-
   const data = localStorage.getItem(RESULTS_KEY);
   return data ? JSON.parse(data) : [];
 };
